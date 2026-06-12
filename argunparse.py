@@ -9,12 +9,12 @@ import itertools
 import logging
 import shlex
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from typing import Dict, List, Optional, Tuple, TypeVar
 
-from . import _typing
-from ._typing import Undefined
+import _types
+from _types import Undefined
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
@@ -100,6 +100,25 @@ def _cast_value(action: argparse.Action, value: _ValueT) -> _ValueT:
     return action.type(value)
 
 
+@dataclass
+class ActionCodec:
+    """Pairs the parse and serialize directions for a single argument type.
+
+    Args:
+        parse: Converts a shell string token to a Python value (replaces `action.type`).
+        serialize: Converts a Python value back to a shell string token (the inverse).
+
+    Example:
+        >>> csv = ActionCodec(parse=lambda s: s.split(","), serialize=",".join)
+        >>> csv.parse("a,b,c")
+        ['a', 'b', 'c']
+        >>> csv.serialize(["a", "b", "c"])
+        'a,b,c'
+    """
+    parse: object
+    serialize: object
+
+
 # ---------------------------------------------------------------------------
 # Unparse context
 # ---------------------------------------------------------------------------
@@ -111,9 +130,11 @@ class _UnparseContext:
     Args:
         parser: The argument parser that defines the schema.
         quoteArgs: Whether to run values through :func:`shlex.quote`.
+        codecs: Per-type codec registry, keyed by the `action.type` callable.
     """
     parser: argparse.ArgumentParser
     quoteArgs: bool
+    codecs: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -141,14 +162,16 @@ def _unparse_argument_value(action: argparse.Action, value: _ValueT, ctx: _Unpar
         usage = formatActionAsString(action)
         raise ParserError(ctx.parser, f"{usage}: Does not accept values, yet {value!r} was passed.")
 
-    try:
-        _cast_value(action, value)
-    except Exception as exception:
-        usage = formatActionAsString(action)
-        message = f"{usage}: Could not cast {type(value)} value ({value!r}) to {action.type}."
-        raise ParserError(ctx.parser, message) from exception
+    codec = ctx.codecs.get(action.type)
+    if codec is None:
+        try:
+            _cast_value(action, value)
+        except Exception as exception:
+            usage = formatActionAsString(action)
+            message = f"{usage}: Could not cast {type(value)} value ({value!r}) to {action.type}."
+            raise ParserError(ctx.parser, message) from exception
 
-    unparsed = str(value)
+    unparsed = codec.serialize(value) if codec else str(value)  # type: ignore[operator]
     if ctx.quoteArgs:
         unparsed = shlex.quote(unparsed)
     return unparsed
@@ -239,7 +262,7 @@ class _AppendStrategy(_ActionStrategy):
 
     def unparse(self, action: argparse.Action, value: _ValueT, ctx: _UnparseContext) -> List[str]:
         usage = formatActionAsString(action)
-        if not _typing.is_collection(value):
+        if not _types.is_collection(value):
             raise ParserError(
                 ctx.parser, f"{usage}: only takes iterable values. invalid value: {value}"
             )
@@ -259,7 +282,7 @@ class _StandardStrategy(_ActionStrategy):
         usage = formatActionAsString(action)
         if action.nargs in ("?", None):
             values = [value]
-        elif not _typing.is_collection(value):
+        elif not _types.is_collection(value):
             raise ParserError(
                 ctx.parser, f"{usage}: only takes iterable values. invalid value: {value}"
             )
@@ -330,6 +353,16 @@ class ArgumentUnparser:
         """
         self.parser = parser
         self.quoteArgs = quoteArgs
+        self._codecs: dict = {}
+
+    def register_codec(self, type_fn: object, codec: ActionCodec) -> None:
+        """Register a codec for actions whose `type` is *type_fn*.
+
+        Args:
+            type_fn: The callable passed as `type=` to `add_argument`.
+            codec: Codec whose `serialize` will be used instead of `str`.
+        """
+        self._codecs[type_fn] = codec
 
     @classmethod
     def from_spec(cls, spec: List[dict], **kwargs) -> "ArgumentUnparser":
@@ -366,6 +399,7 @@ class ArgumentUnparser:
             ['--files', '/path/to/file', '--amount', '12']
         """
         parser = argparse.ArgumentParser()
+        codecs = {}
 
         for index, entry in enumerate(spec):
             if not isinstance(entry, dict):
@@ -385,9 +419,17 @@ class ArgumentUnparser:
                     f"spec[{index}]: 'flags' must be a non-empty list of strings, got {flags!r}"
                 )
 
+            if isinstance(entry.get("type"), ActionCodec):
+                codec = entry["type"]
+                entry["type"] = codec.parse
+                codecs[codec.parse] = codec
+
             parser.add_argument(*flags, **entry)
 
-        return cls(parser, **kwargs)
+        unparser = cls(parser, **kwargs)
+        for type_fn, codec in codecs.items():
+            unparser.register_codec(type_fn, codec)
+        return unparser
 
     def unparseArgs(self, *args, **kwargs) -> List[str]:
         """Unparse the given args/kwargs using an argparse parser.
@@ -522,7 +564,7 @@ class ArgumentUnparser:
         Returns:
             List[str]: Unparsed arguments.
         """
-        ctx = _UnparseContext(parser=self.parser, quoteArgs=self.quoteArgs)
+        ctx = _UnparseContext(parser=self.parser, quoteArgs=self.quoteArgs, codecs=self._codecs)
         for strategy in _STRATEGIES:
             if strategy.matches(action):
                 return strategy.unparse(action, value, ctx)
@@ -662,4 +704,4 @@ def formatActionAsString(action: argparse.Action) -> str:
 
 if __name__ == "__main__":
     import doctest
-    doctest.testmod()
+    doctest.testmod(verbose=True)

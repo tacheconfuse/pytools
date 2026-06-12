@@ -41,6 +41,7 @@ _UnparseContext = _mod._UnparseContext
 _BooleanStrategy = _mod._BooleanStrategy
 _AppendStrategy = _mod._AppendStrategy
 _StandardStrategy = _mod._StandardStrategy
+ActionCodec = _mod.ActionCodec
 
 
 # ---------------------------------------------------------------------------
@@ -179,3 +180,85 @@ class TestDispatcher:
         p = _standard_parser()
         result = ArgumentUnparser(p).unparseArgs(amount=12)
         assert result == ["--amount", "12"]
+
+
+# ---------------------------------------------------------------------------
+# ActionCodec
+# ---------------------------------------------------------------------------
+
+class TestActionCodec:
+    def test_has_parse_and_serialize(self):
+        codec = ActionCodec(parse=int, serialize=str)
+        assert codec.parse("42") == 42
+        assert codec.serialize(42) == "42"
+
+
+# ---------------------------------------------------------------------------
+# register_codec - round-tripping
+# ---------------------------------------------------------------------------
+
+class TestRegisterCodec:
+    def test_no_codec_falls_back_to_str(self):
+        p = _standard_parser()
+        result = ArgumentUnparser(p).unparseArgs(amount=12)
+        assert result == ["--amount", "12"]
+
+    def test_list_type_round_trips_with_codec(self):
+        p = argparse.ArgumentParser()
+        p.add_argument("value", type=list)
+        unparser = ArgumentUnparser(p)
+        unparser.register_codec(list, ActionCodec(parse=list, serialize="".join))
+        args = unparser.unparseArgs("abc")
+        assert args == ["abc"]
+        assert p.parse_args(args).value == list("abc")
+
+    def test_csv_type_round_trips_with_codec(self):
+        p = argparse.ArgumentParser()
+        p.add_argument("--tags", type=lambda s: s.split(","))
+        csv_codec = ActionCodec(
+            parse=lambda s: s.split(","),
+            serialize=",".join,
+        )
+        unparser = ArgumentUnparser(p)
+        unparser.register_codec(p._actions[-1].type, csv_codec)
+        args = unparser.unparseArgs(tags=["a", "b", "c"])
+        assert args == ["--tags", "a,b,c"]
+        assert p.parse_args(args).tags == ["a", "b", "c"]
+
+    def test_codec_does_not_affect_other_actions(self):
+        p = argparse.ArgumentParser()
+        p.add_argument("--amount", type=int)
+        p.add_argument("value", type=list)
+        unparser = ArgumentUnparser(p)
+        unparser.register_codec(list, ActionCodec(parse=list, serialize="".join))
+        args = unparser.unparseArgs("abc", amount=12)
+        assert args == ["abc", "--amount", "12"]
+
+
+# ---------------------------------------------------------------------------
+# from_spec with ActionCodec as type
+# ---------------------------------------------------------------------------
+
+class TestFromSpecCodec:
+    def test_codec_as_type_registers_serialize(self):
+        csv_codec = ActionCodec(
+            parse=lambda s: s.split(","),
+            serialize=",".join,
+        )
+        unparser = ArgumentUnparser.from_spec([
+            {"flags": ["--tags"], "type": csv_codec},
+        ])
+        args = unparser.unparseArgs(tags=["a", "b", "c"])
+        assert args == ["--tags", "a,b,c"]
+
+    def test_codec_as_type_parse_is_used_by_argparse(self):
+        csv_codec = ActionCodec(
+            parse=lambda s: s.split(","),
+            serialize=",".join,
+        )
+        unparser = ArgumentUnparser.from_spec([
+            {"flags": ["--tags"], "type": csv_codec},
+        ])
+        args = unparser.unparseArgs(tags=["a", "b", "c"])
+        reparsed = unparser.parser.parse_args(args)
+        assert reparsed.tags == ["a", "b", "c"]
