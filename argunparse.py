@@ -9,6 +9,7 @@ import itertools
 import logging
 import shlex
 from collections import defaultdict
+from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from typing import Dict, List, Optional, Tuple, TypeVar
 
@@ -38,10 +39,255 @@ class ParserError(RuntimeError):
         super().__init__(message)
 
 
+# ---------------------------------------------------------------------------
+# Private argparse API helpers
+# ---------------------------------------------------------------------------
+
+def _get_parser_actions(parser: argparse.ArgumentParser) -> List[argparse.Action]:
+    """Return all actions registered on *parser*.
+
+    Isolates the single use of `parser._actions` so the rest of the module
+    has no direct dependency on that private attribute.
+
+    Args:
+        parser (argparse.ArgumentParser): Parser whose actions to retrieve.
+
+    Returns:
+        list[argparse.Action]: All actions on the parser.
+    """
+    return parser._actions  # type: ignore[attr-defined]
+
+
+def _is_append_action(action: argparse.Action) -> bool:
+    """Return `True` if *action* behaves like argparse's built-in append action.
+
+    Args:
+        action (argparse.Action): Action to test.
+
+    Returns:
+        bool: `True` when the action accumulates repeated flag values into a list.
+    """
+    return action.__class__.__name__ == "_AppendAction"
+
+
+def _is_help_action(action: argparse.Action) -> bool:
+    """Return `True` if *action* is the standard `-h/--help` action.
+
+    Args:
+        action (argparse.Action): Action to test.
+
+    Returns:
+        bool: `True` when the action represents the built-in help flag.
+    """
+    return action.dest == "help" and action.option_strings == ["-h", "--help"]
+
+
+def _cast_value(action: argparse.Action, value: _ValueT) -> _ValueT:
+    """Attempt to cast *value* through *action*'s type callable.
+
+    Args:
+        action (argparse.Action): Action whose `type` to apply.
+        value (_ValueT): Value to cast.
+
+    Returns:
+        _ValueT: The cast value, or *value* unchanged when `action.type` is `None`.
+
+    Raises:
+        Exception: Re-raises whatever `action.type(value)` raises.
+    """
+    if action.type is None:
+        return value
+    return action.type(value)
+
+
+# ---------------------------------------------------------------------------
+# Unparse context
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _UnparseContext:
+    """Carries parser state needed by strategy classes during unparsing.
+
+    Args:
+        parser: The argument parser that defines the schema.
+        quoteArgs: Whether to run values through :func:`shlex.quote`.
+    """
+    parser: argparse.ArgumentParser
+    quoteArgs: bool
+
+
+# ---------------------------------------------------------------------------
+# Shared low-level helpers (called by strategies)
+# ---------------------------------------------------------------------------
+
+def _unparse_argument_value(action: argparse.Action, value: _ValueT, ctx: _UnparseContext) -> str:
+    """Unparse a single leaf value for *action*.
+
+    Args:
+        action: Action to unparse value for.
+        value: Python value to convert.
+        ctx: Current unparse context.
+
+    Returns:
+        str: Shell-safe string representation of *value*.
+
+    Raises:
+        ParserError: If *action* takes no value but one was supplied.
+        ParserError: If *value* cannot be cast by `action.type`.
+    """
+    default = ctx.parser.get_default(action.dest)
+
+    if action.nargs == 0 and value != default:
+        usage = formatActionAsString(action)
+        raise ParserError(ctx.parser, f"{usage}: Does not accept values, yet {value!r} was passed.")
+
+    try:
+        _cast_value(action, value)
+    except Exception as exception:
+        usage = formatActionAsString(action)
+        message = f"{usage}: Could not cast {type(value)} value ({value!r}) to {action.type}."
+        raise ParserError(ctx.parser, message) from exception
+
+    unparsed = str(value)
+    if ctx.quoteArgs:
+        unparsed = shlex.quote(unparsed)
+    return unparsed
+
+
+def _unparse_values(action: argparse.Action, values: List[_ValueT], ctx: _UnparseContext) -> List[str]:
+    """Unparse one repetition's worth of values for *action*.
+
+    Args:
+        action: Action to unparse arguments for.
+        values: Python values for a single invocation of the action.
+        ctx: Current unparse context.
+
+    Returns:
+        List[str]: Unparsed arguments for this one invocation.
+    """
+    default = ctx.parser.get_default(action.dest)
+    if action.type:
+        try:
+            default = action.type(default)
+        except Exception:
+            usage = formatActionAsString(action)
+            log.warning(f"{usage}: could not cast default {default} to {action.type}")
+
+    if values == [default]:
+        return []
+
+    requiresOpStr = isOptionStringRequired(action)
+
+    if action.nargs == "+":
+        nargs = max(len(values), 1)
+    elif action.nargs == "*":
+        nargs = len(values)
+    elif action.nargs == "?":
+        nargs = min(len(values), 1)
+    elif action.nargs is None:
+        nargs = 1
+    else:
+        nargs = int(action.nargs)
+
+    unparsedArgs = []
+    for index, value_ in enumerate(values, start=1):
+        if isOptionStringRequired(action, value_):
+            requiresOpStr = True
+        if index > nargs:
+            continue
+        unparsedArgs.append(_unparse_argument_value(action, value_, ctx))
+
+    if requiresOpStr:
+        unparsedArgs.insert(0, action.option_strings[0])
+
+    return unparsedArgs
+
+
+# ---------------------------------------------------------------------------
+# Strategy classes - one per action family
+# ---------------------------------------------------------------------------
+
+class _ActionStrategy:
+    """Base class for action-unparsing strategies."""
+
+    def matches(self, action: argparse.Action) -> bool:
+        """Return `True` if this strategy handles *action*."""
+        raise NotImplementedError
+
+    def unparse(self, action: argparse.Action, value: _ValueT, ctx: _UnparseContext) -> List[str]:
+        """Unparse *value* for *action* given *ctx*."""
+        raise NotImplementedError
+
+
+class _BooleanStrategy(_ActionStrategy):
+    """Handles `store_true` / `store_false` actions (`nargs == 0`)."""
+
+    def matches(self, action: argparse.Action) -> bool:
+        return action.nargs == 0
+
+    def unparse(self, action: argparse.Action, value: _ValueT, ctx: _UnparseContext) -> List[str]:
+        if isOptionStringRequired(action, value):
+            return [action.option_strings[0]]
+        return []
+
+
+class _AppendStrategy(_ActionStrategy):
+    """Handles `action="append"` - a list-of-lists value."""
+
+    def matches(self, action: argparse.Action) -> bool:
+        return _is_append_action(action)
+
+    def unparse(self, action: argparse.Action, value: _ValueT, ctx: _UnparseContext) -> List[str]:
+        usage = formatActionAsString(action)
+        if not _typing.is_collection(value):
+            raise ParserError(
+                ctx.parser, f"{usage}: only takes iterable values. invalid value: {value}"
+            )
+        unparsedArgs = []
+        for value_ in value:
+            unparsedArgs.extend(_unparse_values(action, value_, ctx))
+        return unparsedArgs
+
+
+class _StandardStrategy(_ActionStrategy):
+    """Handles all remaining action types (fallback)."""
+
+    def matches(self, action: argparse.Action) -> bool:
+        return True
+
+    def unparse(self, action: argparse.Action, value: _ValueT, ctx: _UnparseContext) -> List[str]:
+        usage = formatActionAsString(action)
+        if action.nargs in ("?", None):
+            values = [value]
+        elif not _typing.is_collection(value):
+            raise ParserError(
+                ctx.parser, f"{usage}: only takes iterable values. invalid value: {value}"
+            )
+        else:
+            nargs = action.nargs
+            if nargs not in ("+", "*") and len(value) != nargs:  # type: ignore[arg-type]
+                raise ParserError(
+                    ctx.parser, f"{usage}: takes exactly {nargs} values, {len(value)} passed."  # type: ignore[arg-type]
+                )
+            values = value  # type: ignore[assignment]
+        return _unparse_values(action, values, ctx)  # type: ignore[arg-type]
+
+
+_STRATEGIES: List[_ActionStrategy] = [
+    _BooleanStrategy(),
+    _AppendStrategy(),
+    _StandardStrategy(),
+]
+
+
+# ---------------------------------------------------------------------------
+# ArgumentUnparser - engine
+# ---------------------------------------------------------------------------
+
 class ArgumentUnparser:
     """For a given `ArgumentParser` and python values, can parse a list of shell string arguments.
 
-    Examples:  
+    Examples:
         >>> parser = argparse.ArgumentParser()
         >>> _ = parser.add_argument("--files", type=str, action="append", nargs="+")
         >>> _ = parser.add_argument("--amount", type=int)
@@ -59,7 +305,7 @@ class ArgumentUnparser:
     Todo:
         TODO: Missing a round-tripping system:
 
-        Obviously, this is a bad example, because we wouldn't usually set the type to list, 
+        Obviously, this is a bad example, because we wouldn't usually set the type to list,
         we'd probably use nargs/append instead. Please ignore that.
 
         >>> parser = argparse.ArgumentParser()
@@ -84,6 +330,64 @@ class ArgumentUnparser:
         """
         self.parser = parser
         self.quoteArgs = quoteArgs
+
+    @classmethod
+    def from_spec(cls, spec: List[dict], **kwargs) -> "ArgumentUnparser":
+        """Construct an `ArgumentUnparser` from a declarative list of argument specs.
+
+        Each entry in *spec* is a plain dict whose `flags` key supplies the
+        positional `*name_or_flags` for :py:meth:`argparse.ArgumentParser.add_argument`.
+        Every other key is forwarded verbatim as a keyword argument.
+
+        Args:
+            spec (list[dict]): Sequence of argument descriptors.  Each dict must
+                contain a `flags` key (a list of flag strings, e.g.
+                `["--files"]` or `["-f", "--files"]`).  All remaining keys
+                are passed directly to `add_argument` (e.g. `type`,
+                `action`, `nargs`, `default`, `required`, ...).
+            **kwargs: Forwarded to :py:class:`ArgumentUnparser.__init__` (e.g.
+                `quoteArgs=False`).
+
+        Returns:
+            ArgumentUnparser: A fully initialised unparser backed by the parser
+            built from *spec*.
+
+        Raises:
+            ValueError: If any entry in *spec* is not a dict, is missing the
+                `flags` key, or `flags` is not a non-empty list.
+
+        Example:
+            >>> unparser = ArgumentUnparser.from_spec([
+            ...     {"flags": ["--files"], "type": str, "action": "append", "nargs": "+"},
+            ...     {"flags": ["--amount"], "type": int},
+            ...     {"flags": ["--debug"], "action": "store_true"},
+            ... ])
+            >>> unparser.unparseArgs(files=[["/path/to/file"]], amount=12)
+            ['--files', '/path/to/file', '--amount', '12']
+        """
+        parser = argparse.ArgumentParser()
+
+        for index, entry in enumerate(spec):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"spec[{index}]: expected a dict, got {type(entry).__name__!r}"
+                )
+
+            entry = dict(entry)
+
+            flags = entry.pop("flags", None)
+
+            if flags is None:
+                raise ValueError(f"spec[{index}]: missing required key 'flags'")
+
+            if not isinstance(flags, list) or not flags:
+                raise ValueError(
+                    f"spec[{index}]: 'flags' must be a non-empty list of strings, got {flags!r}"
+                )
+
+            parser.add_argument(*flags, **entry)
+
+        return cls(parser, **kwargs)
 
     def unparseArgs(self, *args, **kwargs) -> List[str]:
         """Unparse the given args/kwargs using an argparse parser.
@@ -110,7 +414,7 @@ class ArgumentUnparser:
         argsDict.update(self._unparseKeywordArgs(**kwargs))
 
         # Verify if any required arguments are missing.
-        requiredActions = {action for action in self.parser._actions if action.required}
+        requiredActions = {action for action in _get_parser_actions(self.parser) if action.required}
         missingActions = requiredActions - {*argsDict}
 
         if missingActions:
@@ -146,7 +450,7 @@ class ArgumentUnparser:
 
         return argsDict
 
-    def _unparseKeywordArgs(self, **kwargs: _ValueT) -> List[str]:
+    def _unparseKeywordArgs(self, **kwargs: _ValueT) -> _ArgDictT:
         """Unparse **kwargs into the parsers actions.
 
         Note:
@@ -197,7 +501,7 @@ class ArgumentUnparser:
         # WATCHME: Destination might be tricky when you take actions into account?
         #   It works fine for boolean actions (store true/false)
         #   but hasn't been tested into other weird actions.
-        for action_ in self.parser._actions:
+        for action_ in _get_parser_actions(self.parser):
             actionNames = (action_.dest, *action_.option_strings)
             if name in actionNames:
                 action = action_
@@ -208,76 +512,8 @@ class ArgumentUnparser:
 
         return action
 
-    def _getDefault(self, action: argparse.Action) -> _ValueT:
-        """ Return the type-cast default for the given action.
-
-        This method mimics argparse behaviour, which casts the action default to its type.
-
-        Args:
-            action (argparse.Action): Action to fetch a default for.
-
-        Returns:
-            _ValueT: The action's default.
-        """
-        # WATCHME: This might be too much guesswork.
-        default = self.parser.get_default(action.dest)
-
-        if action.type:
-            try:
-                default = action.type(default)
-            except Exception:
-                usage = formatActionAsString(action)
-                log.warning(f"{usage}: could not cast default {default} to {action.type}")
-
-        return default
-
-    def _unparseArgumentValues(self, action: argparse.Action, values: List[_ValueT]) -> List[str]:
-        """Unparse keyword and value argument(s) as necessary for the given action and values.
-
-        This method exists to handle stacking action types such as "append".
-
-        Args:
-            action (argparse.Action): Action to unparse arguments for.
-            values (List[_ValueT]): Python values of the action to unparse.
-
-        Returns:
-            List[str]: Unparsed arguments.
-        """
-        if values == [self._getDefault(action)]:
-            return []
-
-        requiresOpStr = isOptionStringRequired(action)
-
-        unparsedArgs = []
-
-        # HACK: Added this to handle nargs=0 in the case of boolean arguments.
-        if action.nargs == "+":
-            nargs = max(len(values), 1)
-        elif action.nargs == "*":
-            nargs = len(values)
-        elif action.nargs == "?":
-            nargs = min(len(values), 1)
-        elif action.nargs is None:
-            nargs = 1
-        else:
-            nargs = int(action.nargs)
-
-        for index, value_ in enumerate(values, start=1):
-            if isOptionStringRequired(action, value_):
-                requiresOpStr = True
-
-            if index > nargs:
-                continue
-
-            unparsedArgs.append(self._unparseArgumentValue(action, value_))
-
-        if requiresOpStr:
-            unparsedArgs.insert(0, action.option_strings[0])
-
-        return unparsedArgs
-
     def _unparseArgument(self, action: argparse.Action, value: _ValueT) -> List[str]:
-        """Unparse value argument(s) as necessary for the given action.
+        """Dispatch to the correct strategy for the given *action* type.
 
         Args:
             action (argparse.Action): Action to unparse arguments for.
@@ -286,70 +522,11 @@ class ArgumentUnparser:
         Returns:
             List[str]: Unparsed arguments.
         """
-        usage = formatActionAsString(action)
-
-        if action.nargs == 0:
-            return self._unparseArgumentValues(action, [value])
-
-        if action.nargs in ("?", None):
-            nargs = 1
-            value = [value]
-        else:
-            nargs = action.nargs
-
-        # Iterable so we can return remaining values to unparse.
-        if not _typing.is_collection(value):
-            raise ParserError(self.parser, f"{usage}: only takes iterable values. invalid value: {value}")
-
-        elif nargs not in ("+", "*") and len(value) != nargs:
-            raise ParserError(
-                self.parser, f"{usage}: takes exactly {nargs} values, {len(value)} passed."
-            )
-
-        unparsedArgs = []
-
-        if not isinstance(action, argparse._AppendAction):
-            value = [value]
-
-        for value_ in value:
-            unparsedArgs.extend(self._unparseArgumentValues(action, value_))
-
-        return unparsedArgs
-
-    def _unparseArgumentValue(self, action: argparse.Action, value: _ValueT) -> str:
-        """Unparse a value to pass to the given action.
-
-        Args:
-            action (argparse.Action): Action to unparse value for.
-            value (_ValueT): Python value to unparse.
-
-        Returns:
-            str: Value unparsed from the given value passable to the given action.
-
-        Raises:
-            ParserError: If the action does not accept values, but a value was passed.
-            ParserError: If the given value cannot be cast by the action's type.
-        """
-        default = self.parser.get_default(action.dest)
-
-        if action.nargs == 0 and value != default:
-            usage = formatActionAsString(action)
-            raise ParserError(self.parser, f"{usage}: Does not accept values, yet {value!r} was passed.")
-
-        try:
-            self.parser._get_value(action, value)
-        except Exception as exception:
-            usage = formatActionAsString(action)
-            message = f"{usage}: Could not cast {type(value)} value ({value!r}) to {action.type}."
-
-            raise ParserError(self.parser, message) from exception
-
-        unparsed = str(value)
-
-        if self.quoteArgs:
-            unparsed = shlex.quote(unparsed)
-
-        return unparsed
+        ctx = _UnparseContext(parser=self.parser, quoteArgs=self.quoteArgs)
+        for strategy in _STRATEGIES:
+            if strategy.matches(action):
+                return strategy.unparse(action, value, ctx)
+        return []  # unreachable: _StandardStrategy always matches
 
 
 def isOptionStringRequired(action: argparse.Action, value: _ValueT = None) -> bool:
@@ -397,8 +574,8 @@ def _getActionLists(
     """
     positionalActions = []
     keywordActions = []
-    for action in parser._actions:
-        if skipHelp and isinstance(action, argparse._HelpAction):
+    for action in _get_parser_actions(parser):
+        if skipHelp and _is_help_action(action):
             continue
 
         if action.option_strings:
@@ -410,7 +587,7 @@ def _getActionLists(
 
 
 class ChoiceEnumMeta(EnumMeta):
-    """ Enum metaclass to simplify round-tripping with argparse. 
+    """ Enum metaclass to simplify round-tripping with argparse.
 
     See `ChoiceEnum` for an example.
     """
