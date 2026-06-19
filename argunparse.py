@@ -114,7 +114,7 @@ class ActionCodec:
         >>> _ = parser.add_argument("supported", type=int)     # '123' -> 123
         >>> _ = parser.add_argument("unsupported", type=list)  # 'abc' -> ['a', 'b', 'c']
         >>> ArgumentUnparser(parser).unparseArgs(123, ['a', 'b', 'c'])
-        ['123', '\'[\'"\'"\'a\'"\'"\', \'"\'"\'b\'"\'"\', \'"\'"\'c\'"\'"\']\'']
+        ['123', '\\'[\\'"\\'"\\'a\\'"\\'"\\', \\'"\\'"\\'b\\'"\\'"\\', \\'"\\'"\\'c\\'"\\'"\\']\\'']
 
     With codecs:
 
@@ -142,6 +142,7 @@ class ActionCodec:
         ...     represent=",".join,
         ... )
 
+        >>> from pathlib import Path
         >>> PATH_CODEC = ActionCodec(
         ...     construct=Path,
         ...     represent=lambda s: Path(s).as_posix(),
@@ -755,4 +756,4 @@ def formatActionAsString(action: argparse.Action) -> str:
 
 if __name__ == "__main__":
     import doctest
-    doctest.testmod(verbose=True)
+    doctest.testmod()
