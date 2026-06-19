@@ -19,11 +19,10 @@ def _load_argunparse():
     sys.modules.setdefault("pytools", pkg)
 
     spec_t = importlib.util.spec_from_file_location(
-        "pytools._typing", _ROOT / "_typing.py"
+        "_types", _ROOT / "_types.py"
     )
     mod_t = importlib.util.module_from_spec(spec_t)
-    sys.modules["pytools._typing"] = mod_t
-    pkg._typing = mod_t
+    sys.modules["_types"] = mod_t
     spec_t.loader.exec_module(mod_t)
 
     spec_a = importlib.util.spec_from_file_location(
@@ -188,9 +187,9 @@ class TestDispatcher:
 
 class TestActionCodec:
     def test_has_parse_and_serialize(self):
-        codec = ActionCodec(parse=int, serialize=str)
-        assert codec.parse("42") == 42
-        assert codec.serialize(42) == "42"
+        codec = ActionCodec(construct=int, represent=str)
+        assert codec.construct("42") == 42
+        assert codec.represent(42) == "42"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +206,7 @@ class TestRegisterCodec:
         p = argparse.ArgumentParser()
         p.add_argument("value", type=list)
         unparser = ArgumentUnparser(p)
-        unparser.register_codec(list, ActionCodec(parse=list, serialize="".join))
+        unparser.register_codec(list, ActionCodec(construct=list, represent="".join))
         args = unparser.unparseArgs("abc")
         assert args == ["abc"]
         assert p.parse_args(args).value == list("abc")
@@ -216,8 +215,8 @@ class TestRegisterCodec:
         p = argparse.ArgumentParser()
         p.add_argument("--tags", type=lambda s: s.split(","))
         csv_codec = ActionCodec(
-            parse=lambda s: s.split(","),
-            serialize=",".join,
+            construct=lambda s: s.split(","),
+            represent=",".join,
         )
         unparser = ArgumentUnparser(p)
         unparser.register_codec(p._actions[-1].type, csv_codec)
@@ -230,7 +229,7 @@ class TestRegisterCodec:
         p.add_argument("--amount", type=int)
         p.add_argument("value", type=list)
         unparser = ArgumentUnparser(p)
-        unparser.register_codec(list, ActionCodec(parse=list, serialize="".join))
+        unparser.register_codec(list, ActionCodec(construct=list, represent="".join))
         args = unparser.unparseArgs("abc", amount=12)
         assert args == ["abc", "--amount", "12"]
 
@@ -242,8 +241,8 @@ class TestRegisterCodec:
 class TestFromSpecCodec:
     def test_codec_as_type_registers_serialize(self):
         csv_codec = ActionCodec(
-            parse=lambda s: s.split(","),
-            serialize=",".join,
+            construct=lambda s: s.split(","),
+            represent=",".join,
         )
         unparser = ArgumentUnparser.from_spec([
             {"flags": ["--tags"], "type": csv_codec},
@@ -253,8 +252,8 @@ class TestFromSpecCodec:
 
     def test_codec_as_type_parse_is_used_by_argparse(self):
         csv_codec = ActionCodec(
-            parse=lambda s: s.split(","),
-            serialize=",".join,
+            construct=lambda s: s.split(","),
+            represent=",".join,
         )
         unparser = ArgumentUnparser.from_spec([
             {"flags": ["--tags"], "type": csv_codec},

@@ -108,15 +108,66 @@ class ActionCodec:
         parse: Converts a shell string token to a Python value (replaces `action.type`).
         serialize: Converts a Python value back to a shell string token (the inverse).
 
-    Example:
-        >>> csv = ActionCodec(parse=lambda s: s.split(","), serialize=",".join)
-        >>> csv.parse("a,b,c")
+    Without codecs, you could run into this situation:
+
+        >>> parser = argparse.ArgumentParser()
+        >>> _ = parser.add_argument("supported", type=int)     # '123' -> 123
+        >>> _ = parser.add_argument("unsupported", type=list)  # 'abc' -> ['a', 'b', 'c']
+        >>> ArgumentUnparser(parser).unparseArgs(123, ['a', 'b', 'c'])
+        ['123', '\'[\'"\'"\'a\'"\'"\', \'"\'"\'b\'"\'"\', \'"\'"\'c\'"\'"\']\'']
+
+    With codecs:
+
+        >>> LIST_CODEC = ActionCodec(
+        ...     construct=list,
+        ...     represent="".join,
+        ... )
+
+        >>> parser = argparse.ArgumentParser()
+        >>> _ = parser.add_argument("list", type=list)
+        >>> unparser = ArgumentUnparser(parser)
+        >>> _ = unparser.register_codec(LIST_CODEC.construct, LIST_CODEC)
+        >>> unparser.unparseArgs(list=["a", "b", "c"])
+        ['abc']
+
+        >>> parser.parse_args(unparser.unparseArgs(list='abc')).list
         ['a', 'b', 'c']
-        >>> csv.serialize(["a", "b", "c"])
-        'a,b,c'
+
+        Round-trip successful!
+
+    Other examples, with csv and paths:
+
+        >>> CSV_CODEC = ActionCodec(
+        ...     construct=lambda s: s.split(","),
+        ...     represent=",".join,
+        ... )
+
+        >>> PATH_CODEC = ActionCodec(
+        ...     construct=Path,
+        ...     represent=lambda s: Path(s).as_posix(),
+        ... )
+
+        >>> parser = argparse.ArgumentParser()
+        >>> _ = parser.add_argument("--tags", type=lambda s: s.split(","))
+        >>> _ = parser.add_argument("--path", type=Path)
+        >>> unparser = ArgumentUnparser(parser)
+        >>> _ = unparser.register_codec(CSV_CODEC.construct, CSV_CODEC)
+        >>> _ = unparser.register_codec(PATH_CODEC.construct, PATH_CODEC)
+
+        >>> args = unparser.unparseArgs(tags="a,b,c", path=Path("foo/bar"))
+        >>> args
+        ['--tags', 'a,b,c', '--path', 'foo/bar']
+
+        >>> reparsed = parser.parse_args(args)
+        >>> reparsed.tags
+        ['a', 'b', 'c']
+
+        >>> reparsed.path
+        WindowsPath('foo/bar')
+
     """
-    parse: object
-    serialize: object
+    construct: object
+    represent: object
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +222,7 @@ def _unparse_argument_value(action: argparse.Action, value: _ValueT, ctx: _Unpar
             message = f"{usage}: Could not cast {type(value)} value ({value!r}) to {action.type}."
             raise ParserError(ctx.parser, message) from exception
 
-    unparsed = codec.serialize(value) if codec else str(value)  # type: ignore[operator]
+    unparsed = codec.represent(value) if codec else str(value)  # type: ignore[operator]
     if ctx.quoteArgs:
         unparsed = shlex.quote(unparsed)
     return unparsed
@@ -421,8 +472,8 @@ class ArgumentUnparser:
 
             if isinstance(entry.get("type"), ActionCodec):
                 codec = entry["type"]
-                entry["type"] = codec.parse
-                codecs[codec.parse] = codec
+                entry["type"] = codec.construct
+                codecs[codec.construct] = codec
 
             parser.add_argument(*flags, **entry)
 
